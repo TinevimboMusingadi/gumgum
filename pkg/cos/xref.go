@@ -189,14 +189,9 @@ func parseXrefStream(data []byte, offset int64) (*XrefTable, error) {
 	parser := &Parser{lexer: lexer}
 
 	// Parse the indirect object
-	obj, err := parser.ParseIndirectObject()
+	indirect, err := parser.ParseIndirectObject()
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse xref stream object: %w", err)
-	}
-
-	indirect, ok := obj.(*IndirectObject)
-	if !ok {
-		return nil, fmt.Errorf("expected indirect object at xref stream offset")
 	}
 
 	stream, ok := indirect.Object.(*Stream)
