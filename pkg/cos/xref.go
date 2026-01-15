@@ -2,7 +2,9 @@ package cos
 
 import (
 	"bytes"
+	"compress/zlib"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 )
@@ -199,6 +201,13 @@ func parseXrefStream(data []byte, offset int64) (*XrefTable, error) {
 		return nil, fmt.Errorf("expected stream at xref stream offset")
 	}
 
+	// Decompress the stream data before parsing
+	decodedData, err := decodeStreamData(stream)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode xref stream: %w", err)
+	}
+	stream.Data = decodedData
+
 	return decodeXrefStream(stream)
 }
 
@@ -279,15 +288,151 @@ func decodeXrefStream(stream *Stream) (*XrefTable, error) {
 				entry.InUse = true
 				entry.Offset = fields[1]
 				entry.Generation = int(fields[2])
-			case 2: // Compressed object in object stream
-				entry.InUse = true
-				entry.ObjectStreamNum = int(fields[1])
-				entry.IndexInStream = int(fields[2])
-			}
+		case 2: // Compressed object in object stream
+			entry.InUse = true
+			entry.ObjectStreamNum = int(fields[1])
+			entry.IndexInStream = int(fields[2])
+		}
 
-			table.Entries[objNum] = entry
+		table.Entries[objNum] = entry
+	}
+}
+
+	return table, nil
+}
+
+// decodeStreamData decompresses stream data based on Filter.
+// This is a standalone version for use before Reader is initialized.
+func decodeStreamData(s *Stream) ([]byte, error) {
+	data := s.Data
+
+	// Get filter
+	filter := s.Dict.Get("Filter")
+	if filter == nil {
+		return data, nil // No filter
+	}
+
+	// Handle single filter
+	filterName, ok := filter.(Name)
+	if !ok {
+		// Could be an array of filters
+		if arr, ok := filter.(Array); ok && len(arr) > 0 {
+			if n, ok := arr[0].(Name); ok {
+				filterName = n
+			}
 		}
 	}
 
-	return table, nil
+	switch filterName {
+	case "FlateDecode":
+		return decodeFlate(data, s.Dict)
+	default:
+		return data, nil
+	}
+}
+
+// decodeFlate applies zlib decompression with optional predictor.
+func decodeFlate(data []byte, dict Dict) ([]byte, error) {
+	if len(data) == 0 {
+		return data, nil
+	}
+
+	r, err := zlib.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	decoded, err := io.ReadAll(r)
+	if err != nil {
+		// Some streams may be truncated, return what we got
+		if len(decoded) > 0 {
+			err = nil
+		} else {
+			return nil, err
+		}
+	}
+
+	// Apply predictor if present
+	params := dict.Get("DecodeParms")
+	if params == nil {
+		return decoded, nil
+	}
+
+	var paramsDict Dict
+	if d, ok := params.(Dict); ok {
+		paramsDict = d
+	} else {
+		return decoded, nil
+	}
+
+	predictor, _ := paramsDict.GetInt("Predictor")
+	if predictor <= 1 {
+		return decoded, nil
+	}
+
+	columns, _ := paramsDict.GetInt("Columns")
+	if columns == 0 {
+		columns = 1
+	}
+
+	// PNG predictor (10-15)
+	if predictor >= 10 {
+		return applyPNGPredictorXref(decoded, int(columns))
+	}
+
+	return decoded, nil
+}
+
+// applyPNGPredictorXref decodes PNG-filtered data for xref streams.
+func applyPNGPredictorXref(data []byte, columns int) ([]byte, error) {
+	rowSize := columns
+	inputRowSize := rowSize + 1 // +1 for filter byte
+
+	if len(data) == 0 || inputRowSize == 0 {
+		return data, nil
+	}
+
+	numRows := len(data) / inputRowSize
+	if numRows == 0 {
+		return data, nil
+	}
+
+	result := make([]byte, 0, numRows*rowSize)
+	prevRow := make([]byte, rowSize)
+
+	for row := 0; row < numRows; row++ {
+		start := row * inputRowSize
+		if start >= len(data) {
+			break
+		}
+
+		filterType := data[start]
+		rowData := make([]byte, rowSize)
+		
+		srcStart := start + 1
+		srcEnd := srcStart + rowSize
+		if srcEnd > len(data) {
+			srcEnd = len(data)
+		}
+		copy(rowData, data[srcStart:srcEnd])
+
+		switch filterType {
+		case 0: // None
+			// No change
+		case 1: // Sub
+			for i := 1; i < len(rowData); i++ {
+				rowData[i] += rowData[i-1]
+			}
+		case 2: // Up
+			for i := 0; i < len(rowData); i++ {
+				rowData[i] += prevRow[i]
+			}
+		}
+
+		result = append(result, rowData...)
+		copy(prevRow, rowData)
+	}
+
+	return result, nil
 }
